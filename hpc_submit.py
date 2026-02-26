@@ -5,7 +5,14 @@ import invoke
 import os
 import paramiko
 import socket
+import getpass
 from . import hpc_json
+
+try:
+    from qtpy.QtWidgets import QApplication
+    HAS_QT = True
+except ImportError:
+    HAS_QT = False
 
 class Connection():
     def __init__(self):
@@ -13,15 +20,184 @@ class Connection():
         self.pkey = ""
         self.host = ""
         self.con = None
+        self.totp_handler = None
 
-    def open(self, user, host, pkey):
+    def _keyboard_interactive_handler(self, title, instructions, prompt_list):
+        """Handle keyboard-interactive authentication for 2FA (DUO/TOTP)"""
+        if self.totp_handler is None:
+            return []
+
+        responses = []
+        for prompt_tuple in prompt_list:
+            # prompt_tuple is (prompt_text, show_input)
+            prompt_text = prompt_tuple[0] if isinstance(prompt_tuple, tuple) else str(prompt_tuple)
+            prompt_lower = prompt_text.lower()
+        
+            # For 2FA, we need to identify the actual passcode prompt
+            # Skip password prompts (key-based auth handles this)
+            if 'password:' in prompt_lower and 'passcode' not in prompt_lower:
+                responses.append('')  # Empty response for password when using key auth
+            # Handle the actual 2FA passcode prompt
+            elif 'passcode' in prompt_lower:
+                # Build full prompt context including instructions
+                full_prompt = ""
+                if instructions:
+                    full_prompt = instructions.strip() + "\n\n"
+                full_prompt += prompt_text
+                
+                # Call the handler to get the TOTP code from GUI
+                response = self.totp_handler(full_prompt)
+                if response is None:
+                    return []  # User cancelled
+                responses.append(response)
+            else:
+                # For any other prompt, ask the user
+                response = self.totp_handler(prompt_text)
+                if response is None:
+                    return []
+                responses.append(response)
+
+        return responses
+
+    def open(self, user, host, pkey, totp_handler=None):
         self.user = user
         self.pkey = pkey
         self.host = host
+        self.totp_handler = totp_handler
+
         if self.con:
             self.con.close()
-        self.con = fabric.Connection(user = self.user, host = self.host, connect_kwargs = {"key_filename" : self.pkey})
-        ret = self.con.open()
+
+        # Check if file exists
+        if not os.path.exists(self.pkey):
+            raise FileNotFoundError(f"Private key file not found: {self.pkey}")
+
+        # Read first line to detect key format
+        with open(self.pkey, 'r', encoding='utf-8', errors='ignore') as f:
+            first_line = f.readline().strip()
+
+        # Check for public key (common mistake!)
+        if first_line.startswith(("ssh-rsa", "ssh-ed25519", "ecdsa-", "ssh-dss")):
+            raise paramiko.ssh_exception.SSHException(
+                "ERROR: This is a PUBLIC key file, not a PRIVATE key!\n\n"
+                "You need to select the PRIVATE key file (without .pub extension).\n\n"
+                "Public keys look like:\n"
+                "  ssh-rsa AAAAB3NzaC1yc2EAAA...\n\n"
+                "Private keys look like:\n"
+                "  -----BEGIN OPENSSH PRIVATE KEY-----\n"
+                "  or\n"
+                "  -----BEGIN RSA PRIVATE KEY-----\n\n"
+                "The public key goes on the SERVER in ~/.ssh/authorized_keys\n"
+                "The private key stays on YOUR COMPUTER and is used to connect.\n\n"
+                "Look for a file with the SAME name but WITHOUT the .pub extension."
+            )
+
+        # Check for PuTTY format
+        if first_line.startswith("PuTTY-User-Key-File"):
+            raise paramiko.ssh_exception.SSHException(
+                "PuTTY .ppk key format detected. Please convert to OpenSSH format using:\n\n"
+                "Option 1 - PuTTYgen (GUI):\n"
+                "1. Open PuTTYgen\n"
+                "2. Load your .ppk file\n"
+                "3. Go to Conversions → Export OpenSSH key\n"
+                "4. Save as 'id_rsa' (or another name)\n"
+                "5. Use that file in the settings\n\n"
+                "Option 2 - Command line:\n"
+                "puttygen yourkey.ppk -O private-openssh -o id_rsa"
+            )
+
+        # Prepare connection kwargs
+        connect_kwargs = {
+            "key_filename": self.pkey,
+            "look_for_keys": False,  # Don't search default SSH locations
+            "allow_agent": False,     # Don't use SSH agent
+        }
+
+        # Try to pre-load the key to check if it needs a passphrase
+        key_obj = None
+        passphrase = None
+        last_error = None
+
+        # Detect key type and check for passphrase requirement
+        key_types = [
+            (paramiko.RSAKey, "RSA"),
+            (paramiko.Ed25519Key, "Ed25519"),
+            (paramiko.ECDSAKey, "ECDSA"),
+            (paramiko.DSSKey, "DSS")
+        ]
+
+        for key_class, key_name in key_types:
+            try:
+                key_obj = key_class.from_private_key_file(self.pkey)
+                # Successfully loaded without passphrase
+                connect_kwargs["pkey"] = key_obj
+                del connect_kwargs["key_filename"]
+                break
+            except paramiko.ssh_exception.PasswordRequiredException:
+                # Key needs passphrase - prompt user
+                if totp_handler:
+                    passphrase = totp_handler(f"Enter passphrase for {key_name} private key:")
+                    if passphrase:
+                        try:
+                            key_obj = key_class.from_private_key_file(self.pkey, password=passphrase)
+                            connect_kwargs["pkey"] = key_obj
+                            del connect_kwargs["key_filename"]
+                            break
+                        except Exception as e:
+                            last_error = e
+                            # Wrong passphrase or other error, try next key type
+                            continue
+                    else:
+                        raise paramiko.ssh_exception.AuthenticationException("Passphrase required but not provided")
+                else:
+                    raise paramiko.ssh_exception.SSHException(f"{key_name} key requires a passphrase but no handler provided")
+            except Exception as e:
+                last_error = e
+                # Not this key type, try next
+                continue
+
+        # If no key could be loaded, raise the last error with helpful context
+        if key_obj is None and "key_filename" not in connect_kwargs:
+            error_msg = f"Could not load private key from {self.pkey}.\n"
+            error_msg += f"First line of file: {first_line[:50]}...\n\n"
+            error_msg += "Supported formats:\n"
+            error_msg += "• OpenSSH format (starts with '-----BEGIN OPENSSH PRIVATE KEY-----')\n"
+            error_msg += "• Traditional PEM format (starts with '-----BEGIN RSA PRIVATE KEY-----')\n\n"
+            if last_error:
+                error_msg += f"Last error: {str(last_error)}"
+            raise paramiko.ssh_exception.SSHException(error_msg)
+
+        # Create Fabric connection
+        self.con = fabric.Connection(
+            user=self.user, 
+            host=self.host, 
+            connect_kwargs=connect_kwargs
+        )
+
+        # Set host key policy to auto-accept (prevents unknown host errors)
+        self.con.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        # If 2FA handler is supplied, patch Paramiko's keyboard-interactive to use GUI
+        if totp_handler is not None:
+            # Store original auth_interactive_dumb
+            original_auth_interactive_dumb = paramiko.Transport.auth_interactive_dumb
+
+            def patched_auth_interactive_dumb(transport_self, username, handler=None, submethods=''):
+                # Call our handler instead of the default stdin-based one
+                return transport_self.auth_interactive(username, self._keyboard_interactive_handler, submethods)
+
+            try:
+                # Patch Paramiko's default keyboard-interactive handler
+                paramiko.Transport.auth_interactive_dumb = patched_auth_interactive_dumb
+                ret = self.con.open()
+            except Exception as e:
+                raise e
+            finally:
+                # Restore original
+                paramiko.Transport.auth_interactive_dumb = original_auth_interactive_dumb
+        else:
+            ret = self.con.open()
+
         return ret
 
     def close(self):
@@ -88,7 +264,7 @@ class Settings():
     def queue(self):
         return self.settings['queue']
 
-def open_connection(con, settings, mbox):
+def open_connection(con, settings, mbox, totp_callback=None):
     user = settings.username()
     host = settings.hostname()
     pkey = settings.private_key_file()
@@ -100,21 +276,54 @@ def open_connection(con, settings, mbox):
         mbox.appendPlainText(msg)
         return -1
 
+    # Define 2FA handler that prompts through GUI
+    def totp_handler(prompt_text):
+        if totp_callback:
+            # Process events to keep GUI responsive
+            if HAS_QT:
+                QApplication.processEvents()
+            return totp_callback(prompt_text)
+        return None
+
+    # Keep GUI responsive
+    if HAS_QT:
+        QApplication.processEvents()
+    
+    mbox.appendPlainText("Attempting SSH connection...")
+    if HAS_QT:
+        QApplication.processEvents()
+    
     # ssh: 1. open connection
     try:
-        con.open(user, host, pkey)
+        con.open(user, host, pkey, totp_handler=totp_handler if totp_callback else None)
+        # Keep GUI responsive after connection
+        if HAS_QT:
+            QApplication.processEvents()
     except paramiko.ssh_exception.AuthenticationException as err:
         msg  = '<span style="color:darkred">'
         msg += 'AuthenticationException'
         msg += '</span><br>'
-        msg += 'Check user name, authorized_keys, etc.'
+        msg += 'Possible causes:<br>'
+        msg += '• Public key not in server\'s ~/.ssh/authorized_keys<br>'
+        msg += '• Username is incorrect<br>'
+        msg += '• Wrong passphrase (if prompted)<br>'
+        msg += '• Key permissions on server (authorized_keys should be 600)<br>'
+        msg += '<br><b>Error details:</b> ' + str(err)
         mbox.appendHtml(msg)
         return -1
     except paramiko.ssh_exception.SSHException as err:
+        err_str = str(err)
         msg  = '<span style="color:darkred">'
         msg += 'SSHException'
         msg += '</span><br>'
-        msg += 'Check SSH setup, private and public keys, etc.'
+        msg += 'Possible causes:<br>'
+        msg += '• Private key file format is invalid<br>'
+        msg += '• Key is encrypted and passphrase not provided<br>'
+        msg += '• Wrong key type selected<br>'
+        msg += '• File permissions issue (key should be readable)<br>'
+        msg += '<br><b>Error details:</b><br>'
+        # Handle multi-line error messages
+        msg += err_str.replace('\n', '<br>')
         mbox.appendHtml(msg)
         return -1
     except FileNotFoundError as err:

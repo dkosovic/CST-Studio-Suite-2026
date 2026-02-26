@@ -10,6 +10,7 @@ from qtpy.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QInputDialog,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -24,6 +25,7 @@ from qtpy.QtWidgets import (
 
 from qtpy.QtGui import QFont, QIcon
 from qtpy import QtCore
+from qtpy.QtCore import QThread, Signal
 
 from . import hpc_cluster_settings
 from . import hpc_helper
@@ -423,21 +425,131 @@ def show_task_bar_icon_on_windows():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
 ################################################################################
+## SSH Connection Worker Thread
+
+class SSHConnectionWorker(QThread):
+    """Worker thread for SSH connection to prevent GUI freezing"""
+    finished = Signal(int)  # Signal with return code
+    message = Signal(str, str)  # Signal with message type and content
+    request_passphrase = Signal(str, object)  # Signal to request passphrase (prompt, result_container)
+    
+    def __init__(self, con, settings, parent_widget):
+        super().__init__()
+        self.con = con
+        self.settings = settings
+        self.parent_widget = parent_widget
+        
+    def run(self):
+        """Run SSH connection in background thread"""
+        class ThreadSafeMessageBox:
+            """Wrapper to emit messages as signals instead of direct GUI updates"""
+            def __init__(self, worker):
+                self.worker = worker
+                
+            def appendPlainText(self, text):
+                self.worker.message.emit('plain', text)
+                
+            def appendHtml(self, text):
+                self.worker.message.emit('html', text)
+        
+        # Wrapper for passphrase callback that works across threads
+        def thread_safe_passphrase_callback(prompt_text):
+            result_container = {'value': None, 'ready': False}
+            
+            # Emit signal to main thread and wait
+            self.request_passphrase.emit(prompt_text, result_container)
+            
+            # Wait for result (with timeout)
+            timeout_counter = 0
+            while not result_container.get('ready', False) and timeout_counter < 3000:  # 30 second timeout
+                self.msleep(10)  # Sleep 10ms
+                timeout_counter += 1
+            
+            return result_container.get('value', None)
+        
+        mbox = ThreadSafeMessageBox(self)
+        ret = hpc_submit.open_connection(
+            self.con,
+            self.settings,
+            mbox,
+            totp_callback=thread_safe_passphrase_callback
+        )
+        self.finished.emit(ret)
+
+################################################################################
 ## class MyConnect
 
 class MyConnect():
     def __init__(self):
         self.message_box = None
         self.con = hpc_submit.Connection()
+        self.parent = None
+        self.worker_thread = None
 
-    def init(self, message_box, subject):
+    def init(self, message_box, subject, parent=None):
         self.message_box = message_box
         self.subject = subject
+        self.parent = parent
+
+    def _prompt_passcode(self, prompt_text):
+        """Show passphrase dialog - must be called from main thread"""
+        dialog_parent = self.parent or QApplication.activeWindow()
+        
+        passcode, ok = QInputDialog.getText(
+            dialog_parent,
+            "Two-Factor Authentication",
+            prompt_text,
+            QLineEdit.Password
+        )
+        
+        if not ok:
+            return None
+        return passcode
 
     def open(self, settings_json):
+        # Clean up any existing worker thread
+        if self.worker_thread is not None and self.worker_thread.isRunning():
+            self.worker_thread.quit()
+            self.worker_thread.wait()
+        
         settings = hpc_submit.Settings(settings_json)
-        ret = hpc_submit.open_connection(self.con, settings, self.message_box)
-
+        
+        # Create worker thread for SSH connection
+        self.worker_thread = SSHConnectionWorker(
+            self.con,
+            settings,
+            self.parent
+        )
+        
+        # Connect signals
+        self.worker_thread.message.connect(self._handle_message)
+        self.worker_thread.request_passphrase.connect(self._handle_passphrase_request)
+        self.worker_thread.finished.connect(lambda ret: self._connection_finished(ret, settings))
+        
+        # Show connecting message
+        self.message_box.appendPlainText("Connecting to SSH...")
+        
+        # Start worker thread
+        self.worker_thread.start()
+    
+    def _handle_message(self, msg_type, content):
+        """Handle messages from worker thread"""
+        if msg_type == 'plain':
+            self.message_box.appendPlainText(content)
+        elif msg_type == 'html':
+            self.message_box.appendHtml(content)
+    
+    def _handle_passphrase_request(self, prompt_text, result_container):
+        """Handle passphrase request from worker thread - runs on main thread"""
+        # Get passphrase from user
+        passphrase = self._prompt_passcode(prompt_text)
+        
+        # Store result and mark as ready
+        result_container['value'] = passphrase
+        result_container['ready'] = True
+    
+    def _connection_finished(self, ret, settings):
+        """Handle connection completion"""
         if not ret == 0:
             self.message_box.appendHtml('SSH connection: <span style="color:darkred">failed</span>')
             self.subject.notify('conn', False)
@@ -640,7 +752,7 @@ def main():
 
     main_window.show()
 
-    my_connect.init(message_box, subject)
+    my_connect.init(message_box, subject, parent=main_window)
     if app_settings:
         my_connect.open(app_settings)
         my_group_box_scheduler.set_json(app_settings)
