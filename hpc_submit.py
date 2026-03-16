@@ -21,41 +21,38 @@ class Connection():
         self.host = ""
         self.con = None
         self.totp_handler = None
+        self._interactive_prompt_seen = False
+        self._interactive_cancelled = False
 
     def _keyboard_interactive_handler(self, title, instructions, prompt_list):
         """Handle keyboard-interactive authentication for 2FA (DUO/TOTP)"""
         if self.totp_handler is None:
             return []
 
+        context_lines = []
+        if title:
+            context_lines.append(str(title).strip())
+        if instructions:
+            context_lines.append(str(instructions).strip())
+
         responses = []
         for prompt_tuple in prompt_list:
+            self._interactive_prompt_seen = True
             # prompt_tuple is (prompt_text, show_input)
             prompt_text = prompt_tuple[0] if isinstance(prompt_tuple, tuple) else str(prompt_tuple)
-            prompt_lower = prompt_text.lower()
-        
-            # For 2FA, we need to identify the actual passcode prompt
-            # Skip password prompts (key-based auth handles this)
-            if 'password:' in prompt_lower and 'passcode' not in prompt_lower:
-                responses.append('')  # Empty response for password when using key auth
-            # Handle the actual 2FA passcode prompt
-            elif 'passcode' in prompt_lower:
-                # Build full prompt context including instructions
-                full_prompt = ""
-                if instructions:
-                    full_prompt = instructions.strip() + "\n\n"
-                full_prompt += prompt_text
-                
-                # Call the handler to get the TOTP code from GUI
-                response = self.totp_handler(full_prompt)
-                if response is None:
-                    return []  # User cancelled
-                responses.append(response)
-            else:
-                # For any other prompt, ask the user
-                response = self.totp_handler(prompt_text)
-                if response is None:
-                    return []
-                responses.append(response)
+
+            # Always ask the user for keyboard-interactive responses instead of auto-skipping prompts.
+            challenge = str(prompt_text).strip() or "Authentication response:"
+            full_prompt = "\n\n".join([line for line in context_lines if line])
+            if full_prompt:
+                full_prompt += "\n\n"
+            full_prompt += challenge
+
+            response = self.totp_handler(full_prompt)
+            if response is None:
+                self._interactive_cancelled = True
+                return []
+            responses.append(response)
 
         return responses
 
@@ -168,17 +165,22 @@ class Connection():
             raise paramiko.ssh_exception.SSHException(error_msg)
 
         # Create Fabric connection
-        self.con = fabric.Connection(
-            user=self.user, 
-            host=self.host, 
-            connect_kwargs=connect_kwargs
-        )
+        def build_connection(connection_kwargs):
+            self.con = fabric.Connection(
+                user=self.user,
+                host=self.host,
+                connect_kwargs=connection_kwargs
+            )
+            # Set host key policy to auto-accept (prevents unknown host errors)
+            self.con.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        # Set host key policy to auto-accept (prevents unknown host errors)
-        self.con.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        def open_with_interactive_patch():
+            self._interactive_prompt_seen = False
+            self._interactive_cancelled = False
 
-        # If 2FA handler is supplied, patch Paramiko's keyboard-interactive to use GUI
-        if totp_handler is not None:
+            if totp_handler is None:
+                return self.con.open()
+
             # Store original auth_interactive_dumb
             original_auth_interactive_dumb = paramiko.Transport.auth_interactive_dumb
 
@@ -189,14 +191,30 @@ class Connection():
             try:
                 # Patch Paramiko's default keyboard-interactive handler
                 paramiko.Transport.auth_interactive_dumb = patched_auth_interactive_dumb
-                ret = self.con.open()
-            except Exception as e:
-                raise e
+                return self.con.open()
             finally:
                 # Restore original
                 paramiko.Transport.auth_interactive_dumb = original_auth_interactive_dumb
-        else:
-            ret = self.con.open()
+
+        build_connection(connect_kwargs)
+
+        try:
+            ret = open_with_interactive_patch()
+        except paramiko.ssh_exception.AuthenticationException as first_auth_error:
+            # RHEL9 deployments may require account password first, then Duo passcode.
+            # If no keyboard-interactive prompts appeared yet, retry once with explicit password.
+            if (totp_handler is None) or self._interactive_cancelled or self._interactive_prompt_seen:
+                raise
+
+            password_prompt = f"SSH password for {self.user}@{self.host}:"
+            ssh_password = totp_handler(password_prompt)
+            if not ssh_password:
+                raise first_auth_error
+
+            retry_connect_kwargs = dict(connect_kwargs)
+            retry_connect_kwargs["password"] = ssh_password
+            build_connection(retry_connect_kwargs)
+            ret = open_with_interactive_patch()
 
         return ret
 
@@ -495,6 +513,36 @@ def get_scheduler(con, settings, mbox):
         return ""
 
     return ret.stdout
+
+def get_available_gpu_num(con, settings, queue, mbox):
+    if not queue:
+        return None
+
+    udir = settings.utilities_dir()
+
+    cst_job_submit = pathlib.PurePosixPath(udir).joinpath('cst_job_submit')
+    cst_job_submit = '"' + str(cst_job_submit) + '"'
+    cst_job_submit += ' --get-available-gpu-num '
+    cst_job_submit += ' -q ' + '"' + queue + '"'
+
+    try:
+        ret = con.run(cst_job_submit)
+        if ret.stderr:
+            mbox.appendPlainText(ret.stderr)
+            return None
+    except Exception as err:
+        mbox.appendPlainText(str(err))
+        return None
+
+    output = ret.stdout.strip()
+    if not output:
+        return None
+
+    try:
+        return int(output)
+    except ValueError:
+        mbox.appendPlainText('Unexpected GPU query output: ' + output)
+        return None
 
 def main():
     submit()

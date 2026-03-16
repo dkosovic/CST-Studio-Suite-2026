@@ -176,6 +176,8 @@ class GroupBoxScheduler(QGroupBox):
     def __init__(self, parent):
         QGroupBox.__init__(self)
 
+        self.subject = None
+
         label_scheduler = QLabel(parent)
         label_scheduler.setText("Scheduler:")
         self.scheduler = QLabel(parent)
@@ -185,6 +187,7 @@ class GroupBoxScheduler(QGroupBox):
         label_queue = QLabel(parent)
         label_queue.setText("Queue:")
         self.combobox_queue = QComboBox(parent)
+        self.combobox_queue.currentTextChanged.connect(self.queue_changed)
 
         layout = QGridLayout(parent)
         layout.addWidget(label_scheduler, 0, 0)
@@ -195,6 +198,9 @@ class GroupBoxScheduler(QGroupBox):
         self.setTitle("Scheduler settings")
         self.setLayout(layout)
 
+    def attach_status_ctrl(self, subject):
+        self.subject = subject
+
     def json(self):
         app_settings = {}
         app_settings['scheduler'] = self.scheduler.text()
@@ -203,6 +209,16 @@ class GroupBoxScheduler(QGroupBox):
 
     def set_json(self, app_settings):
         self.combobox_queue.setCurrentText(app_settings['queue'])
+
+    def queue_changed(self, queue):
+        if self.subject and queue:
+            self.subject.notify('queue_changed', queue)
+
+    def trigger_gpu_query(self):
+        """Manually trigger GPU query for current queue"""
+        current_queue = self.combobox_queue.currentText()
+        if self.subject and current_queue:
+            self.subject.notify('queue_changed', current_queue)
 
     def update(self, key, val):
         if key == 'conn':
@@ -215,6 +231,8 @@ class GroupBoxScheduler(QGroupBox):
             self.combobox_queue.addItems(val)
             if queue:
                 self.combobox_queue.setCurrentText(queue)
+        if key == 'trigger_initial_gpu_query':
+            self.trigger_gpu_query()
 
 ################################################################################
 ## GroupBoxSimulation
@@ -225,6 +243,7 @@ class GroupBoxSimulation(QGroupBox):
 
         self.setTitle("Simulation settings")
         self.sim_props = hpc_job_submission_lib.SimPropsCST()
+        self.remote_gpu_max = None
 
         label_run_option = QLabel()
         label_run_option.setText("Run option:")
@@ -341,23 +360,41 @@ class GroupBoxSimulation(QGroupBox):
             self.spin_box_nodes.setMinimum(1)
             self.spin_box_nodes.setMaximum(1024)
 
+        # configure GPUs based on god_mode, local solver properties, and remote cluster limits
         if self.god_mode:
-            return
-
-        run_option = self.combobox_run_option.currentText()
-        sim_props = self.sim_props.get_sim_props(run_option)
-
-        # configure GPUs
-        use_gpu = True
-        if type == 'MPI' and (not sim_props.mpi_gpu):
-            use_gpu = False
-
-        if use_gpu and sim_props.multi_gpu:
-            self.combobox_gpus.setMaximum(16)
-        elif use_gpu and sim_props.gpu:
-            self.combobox_gpus.setMaximum(1)
+            # In god mode: ignore local solver limits, but respect remote cluster limits
+            max_val = self.remote_gpu_max if self.remote_gpu_max is not None else 16
         else:
-            self.combobox_gpus.setMaximum(0)
+            # Normal mode: get local solver GPU capabilities
+            run_option = self.combobox_run_option.currentText()
+            sim_props = self.sim_props.get_sim_props(run_option)
+
+            use_gpu = True
+            if type == 'MPI' and (not sim_props.mpi_gpu):
+                use_gpu = False
+
+            if use_gpu and sim_props.multi_gpu:
+                local_max = 16
+            elif use_gpu and sim_props.gpu:
+                local_max = 1
+            else:
+                local_max = 0
+
+            # Combine local solver limits with remote cluster limits
+            if self.remote_gpu_max is not None:
+                # If solver doesn't support GPUs but remote does, use remote limit
+                if local_max == 0:
+                    max_val = self.remote_gpu_max
+                else:
+                    # Both have limits, use the minimum
+                    max_val = min(local_max, self.remote_gpu_max)
+            else:
+                # No remote limit, use local solver limit
+                max_val = local_max
+
+        self.combobox_gpus.setMaximum(max_val)
+        if self.combobox_gpus.value() > max_val:
+            self.combobox_gpus.setValue(max_val)
 
     def json(self):
         app_settings = {}
@@ -382,6 +419,9 @@ class GroupBoxSimulation(QGroupBox):
             self.configure(val)
         if key == 'load_set_json':
             self.set_json(val)
+        if key == 'remote_gpu_max':
+            self.remote_gpu_max = val
+            self.type_changed(self.combobox_type.currentText())
 
     def configure(self, sim_props):
         self.sim_props = sim_props
@@ -485,6 +525,7 @@ class MyConnect():
         self.con = hpc_submit.Connection()
         self.parent = None
         self.worker_thread = None
+        self.settings_json = None
 
     def init(self, message_box, subject, parent=None):
         self.message_box = message_box
@@ -497,7 +538,7 @@ class MyConnect():
         
         passcode, ok = QInputDialog.getText(
             dialog_parent,
-            "Two-Factor Authentication",
+            "SSH Authentication",
             prompt_text,
             QLineEdit.Password
         )
@@ -507,6 +548,8 @@ class MyConnect():
         return passcode
 
     def open(self, settings_json):
+        self.settings_json = settings_json
+
         # Clean up any existing worker thread
         if self.worker_thread is not None and self.worker_thread.isRunning():
             self.worker_thread.quit()
@@ -567,11 +610,43 @@ class MyConnect():
         scheduler_name = scheduler_name.strip()
         self.subject.notify('scheduler_name', scheduler_name)
 
+        # Query GPU limits for the current queue after loading queues
+        self.subject.notify('trigger_initial_gpu_query', True)
+
     def submit(self, settings_json):
         settings = hpc_submit.Settings(settings_json)
         ret = hpc_submit.submit(self.con, settings, self.message_box)
         if not ret == 0:
             self.message_box.appendPlainText("Error: Check cluster configuration and CST project settings")
+
+    def update(self, key, val):
+        if key == 'queue_changed':
+            self._update_remote_gpu_limit(val)
+
+    def _update_remote_gpu_limit(self, queue):
+        if not queue:
+            self.message_box.appendPlainText('GPU query skipped: no queue selected')
+            return
+        if self.con is None or self.con.con is None:
+            self.message_box.appendPlainText('GPU query skipped: not connected')
+            return
+
+        settings_json = self.settings_json or hpc_json.load()
+        if not settings_json:
+            self.message_box.appendPlainText('GPU query skipped: no settings')
+            return
+
+        try:
+            self.message_box.appendPlainText(f'Querying GPU availability for queue: {queue}')
+            settings = hpc_submit.Settings(settings_json)
+            gpu_max = hpc_submit.get_available_gpu_num(self.con, settings, queue, self.message_box)
+            if gpu_max is None:
+                self.message_box.appendPlainText(f'GPU query returned None for queue: {queue}')
+                return
+            self.message_box.appendPlainText(f'Remote GPU max for queue "{queue}": {gpu_max}')
+            self.subject.notify('remote_gpu_max', gpu_max)
+        except Exception as err:
+            self.message_box.appendPlainText(f'GPU query error: {str(err)}')
 
 ################################################################################
 ## QAction classes to handle status control
@@ -637,8 +712,10 @@ def main():
     subject.attach(my_group_box_simulation)
     subject.attach(main_window.my_status_bar)
     subject.attach(message_box)
+    subject.attach(my_connect)
 
     my_group_box_file.attach_status_ctrl(subject)
+    my_group_box_scheduler.attach_status_ctrl(subject)
 
     ################################################################################
     ## toolbar
