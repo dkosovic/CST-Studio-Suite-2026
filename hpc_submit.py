@@ -4,6 +4,7 @@ import fabric
 import invoke
 import os
 import paramiko
+import re
 import socket
 import getpass
 from . import hpc_json
@@ -222,7 +223,8 @@ class Connection():
         self.con.close()
 
     def run(self, cmd):
-        return self.con.run(cmd)
+        # Keep remote command output inside returned result; GUI decides what to display.
+        return self.con.run(cmd, hide=True)
 
     def put(self, src, dst):
         return self.con.put(src, dst)
@@ -281,6 +283,9 @@ class Settings():
 
     def queue(self):
         return self.settings['queue']
+
+    def walltime(self):
+        return self.settings.get('walltime', 'Auto')
 
 def open_connection(con, settings, mbox, totp_callback=None):
     user = settings.username()
@@ -431,9 +436,9 @@ def submit(con, settings, mbox):
             mbox.appendPlainText(ret.stderr)
             return ret.return_code
     except Exception as err:
-        msg  = '\n'
-        msg += 'Directory \"' + dst_dir + '\" already exists.\n'
-        msg += 'Rename or remove the already existing target directory on the cluster.'
+        msg  = '\nFailed to create remote destination directory:\n'
+        msg += f'  path: {dst_dir}\n'
+        msg += f'  error: {err}'
         mbox.appendPlainText(msg)
         return -1
 
@@ -446,7 +451,7 @@ def submit(con, settings, mbox):
             if os.path.isfile(src_file):
                 con.put(src_file, dst_dir)
     except Exception as err:
-        mbox.appendPlainText(str(err))
+        mbox.appendPlainText(f'Failed while uploading project files: {err}')
         return -1
 
     # run CST project
@@ -458,6 +463,10 @@ def submit(con, settings, mbox):
         cst_job_submit += ' -g ' + str(settings.gpus())
     if settings.cores() > 0:
         cst_job_submit += ' --num-cores ' + str(settings.cores())
+    walltime = str(settings.walltime()).strip()
+    if walltime and walltime.lower() not in ['auto', 'none']:
+        walltime_arg = ' -w ' + '"' + walltime + '"'
+        cst_job_submit += walltime_arg
     if (settings.type() != 'Single node'):
         cst_job_submit += ' -a ' + settings.type()
         cst_job_submit += ' -n ' + str(settings.nodes())
@@ -472,8 +481,28 @@ def submit(con, settings, mbox):
         if ret.stderr:
             mbox.appendPlainText(ret.stderr)
             return ret.return_code
+    except invoke.exceptions.UnexpectedExit as err:
+        stderr_text = err.result.stderr if err.result and err.result.stderr else ''
+        stdout_text = err.result.stdout if err.result and err.result.stdout else ''
+        exit_code = err.result.return_code if err.result else -1
+        combined_text_lower = (stdout_text + '\n' + stderr_text).lower()
+        stderr_lower = stderr_text.lower()
+        unknown_option = ('unknown option' in stderr_lower) or ('unrecognized option' in stderr_lower)
+
+        mbox.appendPlainText('Remote command failed while submitting the job:')
+        mbox.appendPlainText(f'  command: {cst_job_submit}')
+        mbox.appendPlainText(f'  exit code: {exit_code}')
+        if stdout_text and stdout_text.strip():
+            mbox.appendPlainText('  stdout:')
+            mbox.appendPlainText(stdout_text)
+        if stderr_text and stderr_text.strip():
+            mbox.appendPlainText('  stderr:')
+            mbox.appendPlainText(stderr_text)
+        if not (stdout_text and stdout_text.strip()) and not (stderr_text and stderr_text.strip()):
+            mbox.appendPlainText(f'  exception: {err}')
+        return exit_code
     except Exception as err:
-        mbox.appendPlainText(str(err))
+        mbox.appendPlainText(f'Submit execution error: {err}')
         return -1
 
     return 0
@@ -543,6 +572,47 @@ def get_available_gpu_num(con, settings, queue, mbox):
     except ValueError:
         mbox.appendPlainText('Unexpected GPU query output: ' + output)
         return None
+
+def _extract_walltime_value(output_text):
+    if not output_text:
+        return None
+
+    text = str(output_text).strip()
+
+    # Match HH:MM (e.g. 167:00)
+    match = re.search(r'(?<!\d)(\d{1,3}:\d{2})(?!\d)', text)
+    if match:
+        return match.group(1)
+
+    # Match D-HH:MM[:SS] and normalize to HH:MM
+    match = re.search(r'(?<!\d)(\d+)-(\d{1,2}):(\d{2})(?::\d{2})?(?!\d)', text)
+    if match:
+        days = int(match.group(1))
+        hours = int(match.group(2))
+        minutes = match.group(3)
+        total_hours = days * 24 + hours
+        return f"{total_hours}:{minutes}"
+
+    return None
+
+def get_available_walltime(con, settings, queue, mbox):
+    if not queue:
+        return None
+
+    udir = settings.utilities_dir()
+    cst_job_submit = pathlib.PurePosixPath(udir).joinpath('cst_job_submit')
+    cst_job_submit = '"' + str(cst_job_submit) + '"'
+    cmd = cst_job_submit + ' --get-available-walltime -q ' + '"' + str(queue) + '"'
+
+    try:
+        ret = con.run(cmd)
+    except Exception:
+        return None
+
+    walltime = _extract_walltime_value(ret.stdout)
+    if walltime is None:
+        walltime = _extract_walltime_value(ret.stderr)
+    return walltime
 
 def main():
     submit()
