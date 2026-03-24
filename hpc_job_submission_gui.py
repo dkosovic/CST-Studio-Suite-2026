@@ -23,9 +23,9 @@ from qtpy.QtWidgets import (
     QWidget,
     QAction)
 
-from qtpy.QtGui import QFont, QIcon
+from qtpy.QtGui import QFont, QIcon, QRegularExpressionValidator
 from qtpy import QtCore
-from qtpy.QtCore import QThread, Signal
+from qtpy.QtCore import QThread, Signal, QRegularExpression
 
 from . import hpc_cluster_settings
 from . import hpc_helper
@@ -231,8 +231,6 @@ class GroupBoxScheduler(QGroupBox):
             self.combobox_queue.addItems(val)
             if queue:
                 self.combobox_queue.setCurrentText(queue)
-        if key == 'trigger_initial_gpu_query':
-            self.trigger_gpu_query()
 
 ################################################################################
 ## GroupBoxSimulation
@@ -244,6 +242,7 @@ class GroupBoxSimulation(QGroupBox):
         self.setTitle("Simulation settings")
         self.sim_props = hpc_job_submission_lib.SimPropsCST()
         self.remote_gpu_max = None
+        self.remote_walltime = None
 
         label_run_option = QLabel()
         label_run_option.setText("Run option:")
@@ -279,6 +278,16 @@ class GroupBoxSimulation(QGroupBox):
         self.spin_box_cores.setMinimum(0)
         self.spin_box_cores.setMaximum(1024)
 
+        label_walltime = QLabel()
+        label_walltime.setText("Walltime:")
+        self.combobox_walltime = QComboBox()
+        self.combobox_walltime.setMinimumWidth(100)
+        self.combobox_walltime.setEditable(True)
+        walltime_validator = QRegularExpressionValidator(
+            QRegularExpression(r'^(Auto|[0-9]{1,3}:[0-5][0-9])$'))
+        self.combobox_walltime.lineEdit().setValidator(walltime_validator)
+        self._refresh_walltime_options(prefer_remote=False)
+
         label_nodes = QLabel()
         label_nodes.setText("Nodes:")
         self.spin_box_nodes = QSpinBox()
@@ -298,6 +307,8 @@ class GroupBoxSimulation(QGroupBox):
         layout.addItem(my_spacer_2, 0, 5)
         layout.addWidget(label_nodes, 0, 6)
         layout.addWidget(self.spin_box_nodes, 0, 7)
+        layout.addWidget(label_walltime, 1, 0)
+        layout.addWidget(self.combobox_walltime, 1, 1)
         layout.addWidget(label_cores, 1, 3)
         layout.addWidget(self.spin_box_cores, 1, 4)
         layout.addWidget(label_gpus, 1, 6)
@@ -403,6 +414,7 @@ class GroupBoxSimulation(QGroupBox):
         app_settings['gpu']  = self.combobox_gpus.value()
         app_settings['core'] = self.spin_box_cores.value()
         app_settings['node'] = self.spin_box_nodes.value()
+        app_settings['walltime'] = self.combobox_walltime.currentText().strip() or 'Auto'
         return app_settings
 
     def set_json(self, app_settings):
@@ -411,6 +423,8 @@ class GroupBoxSimulation(QGroupBox):
         self.combobox_gpus.setValue(app_settings['gpu'])
         self.spin_box_cores.setValue(app_settings['core'])
         self.spin_box_nodes.setValue(app_settings['node'])
+        walltime = app_settings.get('walltime', 'Auto')
+        self.combobox_walltime.setCurrentText(walltime if walltime else 'Auto')
 
     def update(self, key, val):
         if key == 'load':
@@ -419,9 +433,34 @@ class GroupBoxSimulation(QGroupBox):
             self.configure(val)
         if key == 'load_set_json':
             self.set_json(val)
+        if key == 'queue_changed':
+            self.remote_walltime = None
+            self._refresh_walltime_options(prefer_remote=False, reset=True)
         if key == 'remote_gpu_max':
             self.remote_gpu_max = val
             self.type_changed(self.combobox_type.currentText())
+        if key == 'remote_walltime':
+            self.remote_walltime = val
+            self._refresh_walltime_options(prefer_remote=True)
+
+    def _refresh_walltime_options(self, prefer_remote=False, reset=False):
+        current_val = self.combobox_walltime.currentText().strip() if hasattr(self, 'combobox_walltime') else 'Auto'
+        if not current_val or reset:
+            current_val = 'Auto'
+
+        target_val = current_val
+        if prefer_remote and self.remote_walltime and current_val.lower() in ['auto', 'none']:
+            target_val = self.remote_walltime
+
+        self.combobox_walltime.blockSignals(True)
+        self.combobox_walltime.clear()
+        self.combobox_walltime.addItem('Auto')
+        if self.remote_walltime and self.combobox_walltime.findText(self.remote_walltime) < 0:
+            self.combobox_walltime.addItem(self.remote_walltime)
+        if target_val and target_val != 'Auto' and self.combobox_walltime.findText(target_val) < 0:
+            self.combobox_walltime.addItem(target_val)
+        self.combobox_walltime.setCurrentText(target_val if target_val else 'Auto')
+        self.combobox_walltime.blockSignals(False)
 
     def configure(self, sim_props):
         self.sim_props = sim_props
@@ -610,43 +649,52 @@ class MyConnect():
         scheduler_name = scheduler_name.strip()
         self.subject.notify('scheduler_name', scheduler_name)
 
-        # Query GPU limits for the current queue after loading queues
-        self.subject.notify('trigger_initial_gpu_query', True)
-
     def submit(self, settings_json):
-        settings = hpc_submit.Settings(settings_json)
-        ret = hpc_submit.submit(self.con, settings, self.message_box)
-        if not ret == 0:
-            self.message_box.appendPlainText("Error: Check cluster configuration and CST project settings")
+        try:
+            settings = hpc_submit.Settings(settings_json)
+            ret = hpc_submit.submit(self.con, settings, self.message_box)
+        except Exception as err:
+            self.message_box.appendPlainText(f'Submit exception: {err}')
+            ret = -1
+        if ret != 0:
+            self.message_box.appendPlainText('\nSubmission failed — check the details above and verify cluster configuration and CST project settings.')
 
     def update(self, key, val):
         if key == 'queue_changed':
-            self._update_remote_gpu_limit(val)
+            self._update_remote_queue_limits(val)
 
-    def _update_remote_gpu_limit(self, queue):
+    def _update_remote_queue_limits(self, queue):
         if not queue:
-            self.message_box.appendPlainText('GPU query skipped: no queue selected')
+            self.message_box.appendPlainText('Queue limits query skipped: no queue selected')
             return
         if self.con is None or self.con.con is None:
-            self.message_box.appendPlainText('GPU query skipped: not connected')
+            self.message_box.appendPlainText('Queue limits query skipped: not connected')
             return
 
         settings_json = self.settings_json or hpc_json.load()
         if not settings_json:
-            self.message_box.appendPlainText('GPU query skipped: no settings')
+            self.message_box.appendPlainText('Queue limits query skipped: no settings')
             return
 
         try:
-            self.message_box.appendPlainText(f'Querying GPU availability for queue: {queue}')
+            self.message_box.appendPlainText(f'Querying queue limits for: {queue}')
             settings = hpc_submit.Settings(settings_json)
+
             gpu_max = hpc_submit.get_available_gpu_num(self.con, settings, queue, self.message_box)
             if gpu_max is None:
-                self.message_box.appendPlainText(f'GPU query returned None for queue: {queue}')
-                return
-            self.message_box.appendPlainText(f'Remote GPU max for queue "{queue}": {gpu_max}')
+                self.message_box.appendPlainText(f'Remote max GPUs not available for queue: {queue}')
+            else:
+                self.message_box.appendPlainText(f'Remote max GPUs for queue "{queue}": {gpu_max}')
             self.subject.notify('remote_gpu_max', gpu_max)
+
+            walltime = hpc_submit.get_available_walltime(self.con, settings, queue, self.message_box)
+            if walltime is None:
+                self.message_box.appendPlainText(f'Remote walltime for queue "{queue}": cluster default')
+            else:
+                self.message_box.appendPlainText(f'Remote max walltime for queue "{queue}": {walltime}')
+            self.subject.notify('remote_walltime', walltime)
         except Exception as err:
-            self.message_box.appendPlainText(f'GPU query error: {str(err)}')
+            self.message_box.appendPlainText(f'Queue limits query error: {str(err)}')
 
 ################################################################################
 ## QAction classes to handle status control
