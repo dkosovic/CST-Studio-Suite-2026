@@ -278,6 +278,17 @@ class GroupBoxSimulation(QGroupBox):
         self.spin_box_cores.setMinimum(0)
         self.spin_box_cores.setMaximum(1024)
 
+        label_memory = QLabel()
+        label_memory.setText("Memory:")
+        self.combobox_memory = QComboBox()
+        self.combobox_memory.setMinimumWidth(100)
+        self.combobox_memory.setEditable(True)
+        memory_validator = QRegularExpressionValidator(
+            QRegularExpression(r'^(Auto|[1-9][0-9]*(?:[mMgGtT]|[mM][bB]|[gG][bB]|[tT][bB])?)$'))
+        self.combobox_memory.lineEdit().setValidator(memory_validator)
+        self.combobox_memory.addItems(['Auto', '16GB', '32GB', '64GB', '128GB', '256GB', '512GB'])
+        self.combobox_memory.setCurrentText('Auto')
+
         label_walltime = QLabel()
         label_walltime.setText("Walltime:")
         self.combobox_walltime = QComboBox()
@@ -311,8 +322,10 @@ class GroupBoxSimulation(QGroupBox):
         layout.addWidget(self.combobox_walltime, 1, 1)
         layout.addWidget(label_cores, 1, 3)
         layout.addWidget(self.spin_box_cores, 1, 4)
-        layout.addWidget(label_gpus, 1, 6)
-        layout.addWidget(self.combobox_gpus, 1, 7)
+        layout.addWidget(label_memory, 1, 6)
+        layout.addWidget(self.combobox_memory, 1, 7)
+        layout.addWidget(label_gpus, 1, 8)
+        layout.addWidget(self.combobox_gpus, 1, 9)
 
         self.god_mode = self.init_god_mode()
         if self.god_mode:
@@ -413,6 +426,7 @@ class GroupBoxSimulation(QGroupBox):
         app_settings['type'] = self.combobox_type.currentText()
         app_settings['gpu']  = self.combobox_gpus.value()
         app_settings['core'] = self.spin_box_cores.value()
+        app_settings['memory'] = self.combobox_memory.currentText().strip() or 'Auto'
         app_settings['node'] = self.spin_box_nodes.value()
         app_settings['walltime'] = self.combobox_walltime.currentText().strip() or 'Auto'
         return app_settings
@@ -422,6 +436,8 @@ class GroupBoxSimulation(QGroupBox):
         self.combobox_type.setCurrentText(app_settings['type'])
         self.combobox_gpus.setValue(app_settings['gpu'])
         self.spin_box_cores.setValue(app_settings['core'])
+        memory = app_settings.get('memory', 'Auto')
+        self.combobox_memory.setCurrentText(memory if memory else 'Auto')
         self.spin_box_nodes.setValue(app_settings['node'])
         walltime = app_settings.get('walltime', 'Auto')
         self.combobox_walltime.setCurrentText(walltime if walltime else 'Auto')

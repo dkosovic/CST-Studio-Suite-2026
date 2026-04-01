@@ -287,6 +287,34 @@ class Settings():
     def walltime(self):
         return self.settings.get('walltime', 'Auto')
 
+    def memory(self):
+        return self.settings.get('memory', 'Auto')
+
+
+def _memory_to_mb(memory_text):
+    if memory_text is None:
+        return None
+
+    text = str(memory_text).strip()
+    if not text or text.lower() in ['auto', 'none']:
+        return None
+
+    match = re.fullmatch(r'([1-9][0-9]*)([mMgGtT]|[mM][bB]|[gG][bB]|[tT][bB])?', text)
+    if not match:
+        return None
+
+    value = int(match.group(1))
+    unit = match.group(2)
+    unit = 'M' if unit is None else unit.upper()
+
+    if unit in ['M', 'MB']:
+        return str(value)
+    if unit in ['G', 'GB']:
+        return str(value * 1024)
+    if unit in ['T', 'TB']:
+        return str(value * 1024 * 1024)
+    return None
+
 def open_connection(con, settings, mbox, totp_callback=None):
     user = settings.username()
     host = settings.hostname()
@@ -463,6 +491,9 @@ def submit(con, settings, mbox):
         cst_job_submit += ' -g ' + str(settings.gpus())
     if settings.cores() > 0:
         cst_job_submit += ' --num-cores ' + str(settings.cores())
+    memory = _memory_to_mb(settings.memory())
+    if memory is not None:
+        cst_job_submit += ' --request-memory=' + '"' + memory + '"'
     walltime = str(settings.walltime()).strip()
     if walltime and walltime.lower() not in ['auto', 'none']:
         walltime_arg = ' -w ' + '"' + walltime + '"'
