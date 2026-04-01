@@ -26,7 +26,7 @@ class Connection():
         self._interactive_cancelled = False
 
     def _keyboard_interactive_handler(self, title, instructions, prompt_list):
-        """Handle keyboard-interactive authentication for 2FA (DUO/TOTP)"""
+        """Handle keyboard-interactive authentication for 2FA prompts."""
         if self.totp_handler is None:
             return []
 
@@ -202,7 +202,7 @@ class Connection():
         try:
             ret = open_with_interactive_patch()
         except paramiko.ssh_exception.AuthenticationException as first_auth_error:
-            # RHEL9 deployments may require account password first, then Duo passcode.
+            # May require account password first, then 2FA passcode.
             # If no keyboard-interactive prompts appeared yet, retry once with explicit password.
             if (totp_handler is None) or self._interactive_cancelled or self._interactive_prompt_seen:
                 raise
