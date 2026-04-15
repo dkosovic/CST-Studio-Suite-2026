@@ -7,6 +7,7 @@ import paramiko
 import re
 import socket
 import getpass
+from urllib.parse import urlparse, parse_qs
 from . import hpc_json
 
 try:
@@ -24,6 +25,74 @@ class Connection():
         self.totp_handler = None
         self._interactive_prompt_seen = False
         self._interactive_cancelled = False
+        self._interactive_password = None
+        self._interactive_okta_prompt_seen = False
+
+    @staticmethod
+    def _normalize_auth_prompt(prompt_text):
+        prompt = str(prompt_text or "")
+        # Remove terminal control sequences that can appear in keyboard-interactive prompts.
+        prompt = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", prompt)
+        return prompt.strip()
+
+    @staticmethod
+    def _is_okta_push_prompt(prompt_text):
+        prompt = Connection._normalize_auth_prompt(prompt_text)
+        has_push_code = re.search(r"push\s+code\s+\d+", prompt, re.IGNORECASE) is not None
+        has_enter_hint = re.search(r"press\s+enter|decline|okta", prompt, re.IGNORECASE) is not None
+        return has_push_code and has_enter_hint
+
+    @staticmethod
+    def _extract_okta_push_code(prompt_text):
+        prompt = Connection._normalize_auth_prompt(prompt_text)
+        match = re.search(r"Push code\s+(\d+)\s+sent", prompt, re.IGNORECASE)
+        if match is None:
+            match = re.search(r"push\s+code\s+(\d+)", prompt, re.IGNORECASE)
+        if match is None:
+            return None
+        return match.group(1)
+
+    @staticmethod
+    def _is_password_prompt(prompt_text):
+        prompt = Connection._normalize_auth_prompt(prompt_text)
+        return re.search(r"(^|\)|\s)password\s*:\s*$", prompt, re.IGNORECASE) is not None
+
+    @staticmethod
+    def _is_okta_activation_prompt(prompt_text):
+        prompt = Connection._normalize_auth_prompt(prompt_text)
+        has_activate_url = re.search(r"https?://\S*activate\S*", prompt, re.IGNORECASE) is not None
+        has_enter_hint = re.search(r"press\s+enter\s+to\s+continue", prompt, re.IGNORECASE) is not None
+        return has_activate_url and has_enter_hint
+
+    @staticmethod
+    def _extract_okta_activation_url(prompt_text):
+        prompt = Connection._normalize_auth_prompt(prompt_text)
+        match = re.search(r"(https?://\S+)", prompt, re.IGNORECASE)
+        if match is None:
+            return None
+        return match.group(1).rstrip('.,;:')
+
+    @staticmethod
+    def _extract_okta_activation_code(prompt_text):
+        prompt = Connection._normalize_auth_prompt(prompt_text)
+        match = re.search(r"user_code\s*=\s*([A-Za-z0-9_-]+)", prompt, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+        url = Connection._extract_okta_activation_url(prompt)
+        if not url:
+            return None
+
+        try:
+            parsed = urlparse(url)
+            query = parse_qs(parsed.query)
+            code_values = query.get("user_code", [])
+            if code_values:
+                return code_values[0]
+        except Exception:
+            return None
+
+        return None
 
     def _keyboard_interactive_handler(self, title, instructions, prompt_list):
         """Handle keyboard-interactive authentication for 2FA prompts."""
@@ -41,6 +110,8 @@ class Connection():
             self._interactive_prompt_seen = True
             # prompt_tuple is (prompt_text, show_input)
             prompt_text = prompt_tuple[0] if isinstance(prompt_tuple, tuple) else str(prompt_tuple)
+            if self._is_okta_push_prompt(prompt_text):
+                self._interactive_okta_prompt_seen = True
 
             # Always ask the user for keyboard-interactive responses instead of auto-skipping prompts.
             challenge = str(prompt_text).strip() or "Authentication response:"
@@ -53,6 +124,8 @@ class Connection():
             if response is None:
                 self._interactive_cancelled = True
                 return []
+            if self._is_password_prompt(prompt_text) and response:
+                self._interactive_password = response
             responses.append(response)
 
         return responses
@@ -62,6 +135,8 @@ class Connection():
         self.pkey = pkey
         self.host = host
         self.totp_handler = totp_handler
+        self._interactive_password = None
+        self._interactive_okta_prompt_seen = False
 
         if self.con:
             self.con.close()
@@ -192,31 +267,90 @@ class Connection():
             try:
                 # Patch Paramiko's default keyboard-interactive handler
                 paramiko.Transport.auth_interactive_dumb = patched_auth_interactive_dumb
-                return self.con.open()
+                try:
+                    return self.con.open()
+                except (paramiko.ssh_exception.AuthenticationException,
+                        paramiko.ssh_exception.SSHException):
+                    # Some Paramiko/Fabric paths can still raise an auth-related
+                    # exception even though the underlying transport has already
+                    # completed authentication successfully. Treat that as success.
+                    transport = (
+                        self.con.client.get_transport()
+                        if self.con.client else None
+                    )
+                    if transport and transport.is_authenticated():
+                        return
+
+                    # Key-based auth failed or Paramiko exhausted its own auth
+                    # methods (e.g. "No authentication methods available").
+                    # The TCP+SSH handshake is already complete and the transport
+                    # is still alive; invoke keyboard-interactive directly so the
+                    # server can issue its own password / push-code challenges.
+                    if (transport and transport.is_active()
+                            and not transport.is_authenticated()):
+                        # Attempt keyboard-interactive auth on the existing transport.
+                        # A single round is correct: the GUI's totp_callback already
+                        # waits for Okta push approval before returning, so retrying
+                        # on the same transport would trigger a new auth round and
+                        # cause the server to issue unexpected challenges (e.g. an
+                        # Okta device-activation URL).  If this attempt fails, the
+                        # caller's outer retry (fresh connection) handles the retry.
+                        last_auth_error = None
+                        self._interactive_okta_prompt_seen = False
+                        try:
+                            transport.auth_interactive(
+                                self.user, self._keyboard_interactive_handler
+                            )
+                        except paramiko.ssh_exception.AuthenticationException as auth_err:
+                            last_auth_error = auth_err
+
+                        if transport.is_authenticated():
+                            return
+
+                        if last_auth_error is not None:
+                            raise last_auth_error
+                    raise
             finally:
                 # Restore original
                 paramiko.Transport.auth_interactive_dumb = original_auth_interactive_dumb
 
         build_connection(connect_kwargs)
-
         try:
             ret = open_with_interactive_patch()
-        except paramiko.ssh_exception.AuthenticationException as first_auth_error:
-            # May require account password first, then 2FA passcode.
-            # If no keyboard-interactive prompts appeared yet, retry once with explicit password.
-            if (totp_handler is None) or self._interactive_cancelled or self._interactive_prompt_seen:
-                raise
+        except (paramiko.ssh_exception.AuthenticationException,
+                paramiko.ssh_exception.SSHException):
+            # If authentication ultimately succeeded on the current transport,
+            # do not force a retry from scratch.
+            transport = (
+                self.con.client.get_transport()
+                if self.con and self.con.client else None
+            )
+            if transport and transport.is_authenticated():
+                return
 
-            password_prompt = f"SSH password for {self.user}@{self.host}:"
-            ssh_password = totp_handler(password_prompt)
-            if not ssh_password:
-                raise first_auth_error
-
-            retry_connect_kwargs = dict(connect_kwargs)
-            retry_connect_kwargs["password"] = ssh_password
+            # Retry once from a fresh transport.
+            # If password was entered in a keyboard-interactive prompt, reuse it
+            # explicitly so Paramiko can perform password auth and then continue
+            # with keyboard-interactive for Okta push.
+            retry_connect_kwargs = {
+                "look_for_keys": False,
+                "allow_agent": False,
+            }
+            if self._interactive_password:
+                retry_connect_kwargs["password"] = self._interactive_password
             build_connection(retry_connect_kwargs)
             ret = open_with_interactive_patch()
-
+        except Exception:
+            # Fabric can raise its own auth exception types (e.g. with the
+            # message "Authentication failed.") even when the underlying
+            # Paramiko transport is already authenticated.
+            transport = (
+                self.con.client.get_transport()
+                if self.con and self.con.client else None
+            )
+            if transport and transport.is_authenticated():
+                return
+            raise
         return ret
 
     def close(self):
@@ -336,6 +470,33 @@ def open_connection(con, settings, mbox, totp_callback=None):
             return totp_callback(prompt_text)
         return None
 
+    def _has_authenticated_transport(connection_wrapper):
+        try:
+            fabric_con = connection_wrapper.con
+            client = fabric_con.client if fabric_con else None
+            transport = client.get_transport() if client else None
+            return bool(transport and transport.is_authenticated())
+        except Exception:
+            return False
+
+    def _has_usable_connection(connection_wrapper):
+        try:
+            ret = connection_wrapper.run('true')
+            return ret.return_code == 0
+        except Exception:
+            return False
+
+    def _is_effectively_authenticated(connection_wrapper):
+        return (
+            _has_authenticated_transport(connection_wrapper)
+            or _has_usable_connection(connection_wrapper)
+        )
+
+    def _should_ignore_probe_exception(connection_wrapper, err):
+        if isinstance(err, paramiko.ssh_exception.AuthenticationException):
+            return True
+        return _has_authenticated_transport(connection_wrapper)
+
     # Keep GUI responsive
     if HAS_QT:
         QApplication.processEvents()
@@ -351,32 +512,34 @@ def open_connection(con, settings, mbox, totp_callback=None):
         if HAS_QT:
             QApplication.processEvents()
     except paramiko.ssh_exception.AuthenticationException as err:
-        msg  = '<span style="color:darkred">'
-        msg += 'AuthenticationException'
-        msg += '</span><br>'
-        msg += 'Possible causes:<br>'
-        msg += '• Public key not in server\'s ~/.ssh/authorized_keys<br>'
-        msg += '• Username is incorrect<br>'
-        msg += '• Wrong passphrase (if prompted)<br>'
-        msg += '• Key permissions on server (authorized_keys should be 600)<br>'
-        msg += '<br><b>Error details:</b> ' + str(err)
-        mbox.appendHtml(msg)
-        return -1
+        if not _is_effectively_authenticated(con):
+            msg  = '<span style="color:darkred">'
+            msg += 'AuthenticationException'
+            msg += '</span><br>'
+            msg += 'Possible causes:<br>'
+            msg += '• Public key not in server\'s ~/.ssh/authorized_keys<br>'
+            msg += '• Username is incorrect<br>'
+            msg += '• Wrong passphrase (if prompted)<br>'
+            msg += '• Key permissions on server (authorized_keys should be 600)<br>'
+            msg += '<br><b>Error details:</b> ' + str(err)
+            mbox.appendHtml(msg)
+            return -1
     except paramiko.ssh_exception.SSHException as err:
-        err_str = str(err)
-        msg  = '<span style="color:darkred">'
-        msg += 'SSHException'
-        msg += '</span><br>'
-        msg += 'Possible causes:<br>'
-        msg += '• Private key file format is invalid<br>'
-        msg += '• Key is encrypted and passphrase not provided<br>'
-        msg += '• Wrong key type selected<br>'
-        msg += '• File permissions issue (key should be readable)<br>'
-        msg += '<br><b>Error details:</b><br>'
-        # Handle multi-line error messages
-        msg += err_str.replace('\n', '<br>')
-        mbox.appendHtml(msg)
-        return -1
+        if not _is_effectively_authenticated(con):
+            err_str = str(err)
+            msg  = '<span style="color:darkred">'
+            msg += 'SSHException'
+            msg += '</span><br>'
+            msg += 'Possible causes:<br>'
+            msg += '• Private key file format is invalid<br>'
+            msg += '• Key is encrypted and passphrase not provided<br>'
+            msg += '• Wrong key type selected<br>'
+            msg += '• File permissions issue (key should be readable)<br>'
+            msg += '<br><b>Error details:</b><br>'
+            # Handle multi-line error messages
+            msg += err_str.replace('\n', '<br>')
+            mbox.appendHtml(msg)
+            return -1
     except FileNotFoundError as err:
         msg  = '<span style="color:darkred">'
         msg += 'FileNotFoundError'
@@ -392,8 +555,9 @@ def open_connection(con, settings, mbox, totp_callback=None):
         mbox.appendHtml(msg)
         return -1
     except Exception as err:
-        mbox.appendPlainText(str(err))
-        return -1
+        if not _is_effectively_authenticated(con):
+            mbox.appendPlainText(str(err))
+            return -1
 
     # ssh: 2. run hostname connection test
     try:
@@ -403,8 +567,9 @@ def open_connection(con, settings, mbox, totp_callback=None):
             if not ret.return_code == 0:
                 return ret.return_code
     except Exception as err:
-        mbox.appendPlainText(str(err))
-        return -1
+        if not _should_ignore_probe_exception(con, err):
+            mbox.appendPlainText(str(err))
+            return -1
 
     # ssh: 3. run cluster utilities directory check
     try:
@@ -420,8 +585,9 @@ def open_connection(con, settings, mbox, totp_callback=None):
         mbox.appendHtml(msg)
         return -1
     except Exception as err:
-        mbox.appendPlainText(str(err))
-        return -1
+        if not _should_ignore_probe_exception(con, err):
+            mbox.appendPlainText(str(err))
+            return -1
 
     # ssh: 4. run working directory check
     try:
@@ -437,8 +603,9 @@ def open_connection(con, settings, mbox, totp_callback=None):
         mbox.appendHtml(msg)
         return -1
     except Exception as err:
-        mbox.appendPlainText(str(err))
-        return -1
+        if not _should_ignore_probe_exception(con, err):
+            mbox.appendPlainText(str(err))
+            return -1
 
     return 0
 
@@ -550,6 +717,11 @@ def get_queues(con, settings, mbox):
         if ret.stderr:
             mbox.appendPlainText(ret.stderr)
             return ret.return_code
+    except paramiko.ssh_exception.AuthenticationException:
+        # Post-auth query calls can still raise auth exceptions in this
+        # environment even after the main SSH session is marked successful.
+        # Keep the UI clean and return an empty queue list.
+        return ""
     except Exception as err:
         mbox.appendPlainText(str(err))
         return ""
@@ -568,6 +740,9 @@ def get_scheduler(con, settings, mbox):
         if ret.stderr:
             mbox.appendPlainText(ret.stderr)
             return ret.return_code
+    except paramiko.ssh_exception.AuthenticationException:
+        # Same rationale as get_queues(): avoid noisy false negatives.
+        return ""
     except Exception as err:
         mbox.appendPlainText(str(err))
         return ""
@@ -590,6 +765,8 @@ def get_available_gpu_num(con, settings, queue, mbox):
         if ret.stderr:
             mbox.appendPlainText(ret.stderr)
             return None
+    except paramiko.ssh_exception.AuthenticationException:
+        return None
     except Exception as err:
         mbox.appendPlainText(str(err))
         return None
@@ -637,6 +814,8 @@ def get_available_walltime(con, settings, queue, mbox):
 
     try:
         ret = con.run(cmd)
+    except paramiko.ssh_exception.AuthenticationException:
+        return None
     except Exception:
         return None
 

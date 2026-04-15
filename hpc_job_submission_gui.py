@@ -554,11 +554,11 @@ class SSHConnectionWorker(QThread):
             # Emit signal to main thread and wait
             self.request_passphrase.emit(prompt_text, result_container)
             
-            # Wait for result (with timeout)
-            timeout_counter = 0
-            while not result_container.get('ready', False) and timeout_counter < 3000:  # 30 second timeout
-                self.msleep(10)  # Sleep 10ms
-                timeout_counter += 1
+            # Wait until the main-thread dialog handler sets the result.
+            # A fixed short timeout can force an unintended None response during
+            # Okta push/device flows and trigger PAM conversation failure.
+            while not result_container.get('ready', False):
+                self.msleep(10)
             
             return result_container.get('value', None)
         
@@ -589,8 +589,88 @@ class MyConnect():
 
     def _prompt_passcode(self, prompt_text):
         """Show passphrase dialog - must be called from main thread"""
+        if hpc_submit.Connection._is_okta_push_prompt(prompt_text):
+            push_code = hpc_submit.Connection._extract_okta_push_code(prompt_text)
+            dialog_parent = self.parent or QApplication.activeWindow()
+            msg_box = QMessageBox(dialog_parent)
+            msg_box.setWindowTitle("Okta Push Verification")
+            msg_box.setIcon(QMessageBox.Information)
+            if push_code:
+                self.message_box.appendPlainText(f"Okta push sent. Push code: {push_code}")
+                msg_box.setText(
+                    "<b>Okta push notification sent. Push code: " + push_code + "</b><br><br>"
+                    "Approve the notification on your device, then click OK to continue."
+                )
+            else:
+                self.message_box.appendPlainText("Okta push sent. Approve on your device.")
+                msg_box.setText(
+                    "<b>Okta push notification sent.</b><br><br>"
+                    "Approve the notification on your device, then click OK to continue."
+                )
+            msg_box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+            msg_box.setDefaultButton(QMessageBox.Ok)
+            result = msg_box.exec_()
+            if result == QMessageBox.Cancel:
+                self.message_box.appendPlainText("Okta push declined by user.")
+                # Send explicit decline to the keyboard-interactive prompt.
+                return "n"
+
+            self.message_box.appendPlainText("Okta push approved. Continuing...")
+            # For SSH keyboard-interactive, pressing Enter with no input is encoded
+            # as a zero-length string (RFC 4256).
+            return ""
+
+        if hpc_submit.Connection._is_okta_activation_prompt(prompt_text):
+            activation_url = hpc_submit.Connection._extract_okta_activation_url(prompt_text)
+            activation_code = hpc_submit.Connection._extract_okta_activation_code(prompt_text)
+            dialog_parent = self.parent or QApplication.activeWindow()
+
+            if activation_code:
+                self.message_box.appendPlainText(f"Okta activation required. User code: {activation_code}")
+            else:
+                self.message_box.appendPlainText("Okta activation required.")
+
+            if activation_url:
+                self.message_box.appendPlainText(f"Opening activation URL: {activation_url}")
+                try:
+                    webbrowser.open(activation_url)
+                except Exception:
+                    self.message_box.appendPlainText("Could not open browser automatically. Open the URL manually.")
+
+            msg_box = QMessageBox(dialog_parent)
+            msg_box.setWindowTitle("Okta Activation Required")
+            msg_box.setIcon(QMessageBox.Information)
+            if activation_code and activation_url:
+                msg_box.setText(
+                    "<b>Okta activation required.</b><br><br>"
+                    "Open the activation page, complete the sign-in challenge, "
+                    "then click OK to continue.<br><br>"
+                    "User code: <b>" + activation_code + "</b><br>"
+                    "URL: " + activation_url
+                )
+            elif activation_url:
+                msg_box.setText(
+                    "<b>Okta activation required.</b><br><br>"
+                    "Open the activation page, complete the sign-in challenge, "
+                    "then click OK to continue.<br><br>"
+                    "URL: " + activation_url
+                )
+            else:
+                msg_box.setText(
+                    "<b>Okta activation required.</b><br><br>"
+                    "Complete the sign-in challenge shown by your organization, "
+                    "then click OK to continue."
+                )
+            msg_box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+            msg_box.setDefaultButton(QMessageBox.Ok)
+            result = msg_box.exec_()
+            if result == QMessageBox.Cancel:
+                self.message_box.appendPlainText("Okta activation cancelled by user.")
+                return None
+            self.message_box.appendPlainText("Okta activation completed. Continuing...")
+            return "\n"
+
         dialog_parent = self.parent or QApplication.activeWindow()
-        
         passcode, ok = QInputDialog.getText(
             dialog_parent,
             "SSH Authentication",
@@ -639,6 +719,10 @@ class MyConnect():
     
     def _handle_passphrase_request(self, prompt_text, result_container):
         """Handle passphrase request from worker thread - runs on main thread"""
+        prompt_preview = " ".join(str(prompt_text).split())
+        if prompt_preview:
+            self.message_box.appendPlainText(f"Authentication challenge received: {prompt_preview}")
+
         # Get passphrase from user
         passphrase = self._prompt_passcode(prompt_text)
         
