@@ -36,6 +36,7 @@ from . import observer
 import os
 import pathlib
 import sys
+import traceback
 import webbrowser
 
 def get_icon(icon):
@@ -719,9 +720,10 @@ class MyConnect():
     
     def _handle_passphrase_request(self, prompt_text, result_container):
         """Handle passphrase request from worker thread - runs on main thread"""
-        prompt_preview = " ".join(str(prompt_text).split())
-        if prompt_preview:
-            self.message_box.appendPlainText(f"Authentication challenge received: {prompt_preview}")
+        if hpc_submit.is_debug_enabled():
+            prompt_preview = " ".join(str(prompt_text).split())
+            if prompt_preview:
+                self.message_box.appendPlainText(f"Authentication challenge received: {prompt_preview}")
 
         # Get passphrase from user
         passphrase = self._prompt_passcode(prompt_text)
@@ -740,14 +742,29 @@ class MyConnect():
         self.message_box.appendHtml('SSH connection: <span style="color:green">success</span>')
         self.subject.notify('conn', True)
 
-        queue_entries = hpc_submit.get_queues(self.con, settings, self.message_box)
-        queue_entries = queue_entries.strip()
-        queue_entries = queue_entries.split(':')
-        self.subject.notify('queue_entries', queue_entries)
+        try:
+            queue_entries_raw = hpc_submit.get_queues(self.con, settings, self.message_box)
+            queue_entries_text = str(queue_entries_raw or '').strip()
+            if queue_entries_text:
+                queue_entries = queue_entries_text.split(':')
+                self.subject.notify('queue_entries', queue_entries)
+            else:
+                self.message_box.appendPlainText('No queue entries were returned by the remote scheduler query.')
 
-        scheduler_name = hpc_submit.get_scheduler(self.con, settings, self.message_box)
-        scheduler_name = scheduler_name.strip()
-        self.subject.notify('scheduler_name', scheduler_name)
+            scheduler_name_raw = hpc_submit.get_scheduler(self.con, settings, self.message_box)
+            scheduler_name = str(scheduler_name_raw or '').strip()
+            if scheduler_name:
+                self.subject.notify('scheduler_name', scheduler_name)
+            else:
+                self.message_box.appendPlainText('Scheduler name query returned no value.')
+        except Exception as err:
+            self.message_box.appendPlainText(f'Post-connection scheduler setup error: {err}')
+            if hpc_submit.is_debug_enabled():
+                tb = ''.join(traceback.format_exception(type(err), err, err.__traceback__)).strip()
+                if tb:
+                    self.message_box.appendPlainText('----- DEBUG TRACEBACK START -----')
+                    self.message_box.appendPlainText(tb)
+                    self.message_box.appendPlainText('----- DEBUG TRACEBACK END -----')
 
     def submit(self, settings_json):
         try:
@@ -755,6 +772,12 @@ class MyConnect():
             ret = hpc_submit.submit(self.con, settings, self.message_box)
         except Exception as err:
             self.message_box.appendPlainText(f'Submit exception: {err}')
+            if hpc_submit.is_debug_enabled():
+                tb = ''.join(traceback.format_exception(type(err), err, err.__traceback__)).strip()
+                if tb:
+                    self.message_box.appendPlainText('----- DEBUG TRACEBACK START -----')
+                    self.message_box.appendPlainText(tb)
+                    self.message_box.appendPlainText('----- DEBUG TRACEBACK END -----')
             ret = -1
         if ret != 0:
             self.message_box.appendPlainText('\nSubmission failed — check the details above and verify cluster configuration and CST project settings.')
@@ -795,6 +818,12 @@ class MyConnect():
             self.subject.notify('remote_walltime', walltime)
         except Exception as err:
             self.message_box.appendPlainText(f'Queue limits query error: {str(err)}')
+            if hpc_submit.is_debug_enabled():
+                tb = ''.join(traceback.format_exception(type(err), err, err.__traceback__)).strip()
+                if tb:
+                    self.message_box.appendPlainText('----- DEBUG TRACEBACK START -----')
+                    self.message_box.appendPlainText(tb)
+                    self.message_box.appendPlainText('----- DEBUG TRACEBACK END -----')
 
 ################################################################################
 ## QAction classes to handle status control

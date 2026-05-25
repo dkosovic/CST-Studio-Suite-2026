@@ -7,6 +7,8 @@ import paramiko
 import re
 import socket
 import getpass
+import traceback
+from types import SimpleNamespace
 from urllib.parse import urlparse, parse_qs
 from . import hpc_json
 
@@ -15,6 +17,29 @@ try:
     HAS_QT = True
 except ImportError:
     HAS_QT = False
+
+
+def is_debug_enabled():
+    value = str(os.environ.get('HPC_SUBMIT_DEBUG', '')).strip().lower()
+    return value in ['1', 'true', 'yes', 'on']
+
+
+def _append_exception(mbox, err, context=None):
+    if context:
+        mbox.appendPlainText(f'{context}: {err}')
+    else:
+        mbox.appendPlainText(str(err))
+
+    if not is_debug_enabled():
+        return
+
+    tb = ''.join(traceback.format_exception(type(err), err, err.__traceback__)).strip()
+    if not tb:
+        return
+
+    mbox.appendPlainText('----- DEBUG TRACEBACK START -----')
+    mbox.appendPlainText(tb)
+    mbox.appendPlainText('----- DEBUG TRACEBACK END -----')
 
 class Connection():
     def __init__(self):
@@ -280,45 +305,25 @@ class Connection():
                     )
                     if transport and transport.is_authenticated():
                         return
-
-                    # Key-based auth failed or Paramiko exhausted its own auth
-                    # methods (e.g. "No authentication methods available").
-                    # The TCP+SSH handshake is already complete and the transport
-                    # is still alive; invoke keyboard-interactive directly so the
-                    # server can issue its own password / push-code challenges.
-                    if (transport and transport.is_active()
-                            and not transport.is_authenticated()):
-                        # Attempt keyboard-interactive auth on the existing transport.
-                        # A single round is correct: the GUI's totp_callback already
-                        # waits for Okta push approval before returning, so retrying
-                        # on the same transport would trigger a new auth round and
-                        # cause the server to issue unexpected challenges (e.g. an
-                        # Okta device-activation URL).  If this attempt fails, the
-                        # caller's outer retry (fresh connection) handles the retry.
-                        last_auth_error = None
-                        self._interactive_okta_prompt_seen = False
-                        try:
-                            transport.auth_interactive(
-                                self.user, self._keyboard_interactive_handler
-                            )
-                        except paramiko.ssh_exception.AuthenticationException as auth_err:
-                            last_auth_error = auth_err
-
-                        if transport.is_authenticated():
-                            return
-
-                        if last_auth_error is not None:
-                            raise last_auth_error
                     raise
             finally:
                 # Restore original
                 paramiko.Transport.auth_interactive_dumb = original_auth_interactive_dumb
 
+        def open_with_agent_fallback():
+            # Mirror OpenSSH-style behavior: try keys from agent/default locations.
+            agent_kwargs = {
+                "look_for_keys": True,
+                "allow_agent": True,
+            }
+            build_connection(agent_kwargs)
+            return open_with_interactive_patch()
+
         build_connection(connect_kwargs)
         try:
             ret = open_with_interactive_patch()
         except (paramiko.ssh_exception.AuthenticationException,
-                paramiko.ssh_exception.SSHException):
+                paramiko.ssh_exception.SSHException) as auth_err:
             # If authentication ultimately succeeded on the current transport,
             # do not force a retry from scratch.
             transport = (
@@ -329,17 +334,43 @@ class Connection():
                 return
 
             # Retry once from a fresh transport.
-            # If password was entered in a keyboard-interactive prompt, reuse it
-            # explicitly so Paramiko can perform password auth and then continue
-            # with keyboard-interactive for Okta push.
-            retry_connect_kwargs = {
-                "look_for_keys": False,
-                "allow_agent": False,
-            }
-            if self._interactive_password:
-                retry_connect_kwargs["password"] = self._interactive_password
+            # Preserve the original key configuration for the retry.
+            retry_connect_kwargs = dict(connect_kwargs)
+            retry_connect_kwargs["look_for_keys"] = False
+            retry_connect_kwargs["allow_agent"] = False
+
+            # Do not force direct password auth on retry. Let the server drive
+            # keyboard-interactive challenges (password + Duo/passcode).
+            # This avoids method-mismatch failures on clusters that only allow
+            # publickey + keyboard-interactive.
             build_connection(retry_connect_kwargs)
-            ret = open_with_interactive_patch()
+            try:
+                ret = open_with_interactive_patch()
+            except (paramiko.ssh_exception.AuthenticationException,
+                    paramiko.ssh_exception.SSHException) as retry_err:
+                can_retry_interactive = (
+                    totp_handler is not None
+                    and not self._interactive_cancelled
+                )
+                if can_retry_interactive:
+                    # One final clean retry lets the user re-enter password/
+                    # passcode on a fresh transport when the previous
+                    # interactive round failed.
+                    self._interactive_password = None
+                    final_retry_kwargs = dict(connect_kwargs)
+                    final_retry_kwargs["look_for_keys"] = False
+                    final_retry_kwargs["allow_agent"] = False
+                    build_connection(final_retry_kwargs)
+                    try:
+                        ret = open_with_interactive_patch()
+                    except (paramiko.ssh_exception.AuthenticationException,
+                            paramiko.ssh_exception.SSHException):
+                        ret = open_with_agent_fallback()
+                else:
+                    if totp_handler is not None and not self._interactive_cancelled:
+                        ret = open_with_agent_fallback()
+                    else:
+                        raise
         except Exception:
             # Fabric can raise its own auth exception types (e.g. with the
             # message "Authentication failed.") even when the underlying
@@ -356,9 +387,60 @@ class Connection():
     def close(self):
         self.con.close()
 
+    def _get_authenticated_client(self):
+        try:
+            client = self.con.client if self.con else None
+            transport = client.get_transport() if client else None
+            if transport and transport.is_authenticated() and transport.is_active():
+                return client
+            return None
+        except Exception:
+            return None
+
+    def _has_authenticated_transport(self):
+        return self._get_authenticated_client() is not None
+
+    def _run_via_paramiko_transport(self, cmd, client=None):
+        client = client or (self.con.client if self.con else None)
+        if client is None:
+            raise paramiko.ssh_exception.AuthenticationException('No SSH client available for command execution')
+
+        stdin, stdout, stderr = client.exec_command(cmd)
+        stdout_text = stdout.read().decode('utf-8', errors='replace')
+        stderr_text = stderr.read().decode('utf-8', errors='replace')
+        return_code = stdout.channel.recv_exit_status()
+        return SimpleNamespace(stdout=stdout_text, stderr=stderr_text, return_code=return_code)
+
     def run(self, cmd):
         # Keep remote command output inside returned result; GUI decides what to display.
-        return self.con.run(cmd, hide=True)
+        fallback_client = self._get_authenticated_client()
+        try:
+            return self.con.run(cmd, hide=True)
+        except Exception as err:
+            is_auth_exception = isinstance(err, paramiko.ssh_exception.AuthenticationException)
+            if not is_auth_exception:
+                # Some Fabric/Paramiko stacks wrap this as a different class while
+                # preserving the same message text.
+                is_auth_exception = (
+                    err.__class__.__name__ == 'AuthenticationException'
+                    or 'authentication failed' in str(err).lower()
+                )
+
+            if not is_auth_exception:
+                raise
+
+            # In some 2FA flows, Fabric may try to re-open an already-authenticated
+            # transport for each command and fail auth on the re-open attempt.
+            # If a transport is already authenticated, execute via Paramiko directly.
+            current_client = self._get_authenticated_client()
+            if current_client is not None:
+                return self._run_via_paramiko_transport(cmd, client=current_client)
+
+            # Fabric may replace the client during a failed re-open attempt.
+            # Use the authenticated client captured before calling con.run().
+            if fallback_client is not None:
+                return self._run_via_paramiko_transport(cmd, client=fallback_client)
+            raise
 
     def put(self, src, dst):
         return self.con.put(src, dst)
@@ -554,9 +636,31 @@ def open_connection(con, settings, mbox, totp_callback=None):
         msg += 'Check the hostname, network connection, etc.'
         mbox.appendHtml(msg)
         return -1
+    except paramiko.ssh_exception.NoValidConnectionsError as err:
+        msg  = '<span style="color:darkred">'
+        msg += 'NoValidConnectionsError'
+        msg += '</span><br>'
+        msg += 'Could not connect to SSH service on the target host.<br>'
+        msg += 'Check hostname/port, VPN, firewall, and whether the cluster login node is reachable.<br>'
+        msg += '<br><b>Error details:</b> ' + str(err)
+        mbox.appendHtml(msg)
+        if is_debug_enabled():
+            _append_exception(mbox, err, 'SSH network connection failed')
+        return -1
+    except (TimeoutError, socket.timeout) as err:
+        msg  = '<span style="color:darkred">'
+        msg += 'ConnectionTimeout'
+        msg += '</span><br>'
+        msg += 'SSH connection attempt timed out.<br>'
+        msg += 'Check VPN/network access, cluster hostname, firewall rules, and SSH service availability.<br>'
+        msg += '<br><b>Error details:</b> ' + str(err)
+        mbox.appendHtml(msg)
+        if is_debug_enabled():
+            _append_exception(mbox, err, 'SSH open timeout')
+        return -1
     except Exception as err:
         if not _is_effectively_authenticated(con):
-            mbox.appendPlainText(str(err))
+            _append_exception(mbox, err, 'SSH open failed')
             return -1
 
     # ssh: 2. run hostname connection test
@@ -568,7 +672,7 @@ def open_connection(con, settings, mbox, totp_callback=None):
                 return ret.return_code
     except Exception as err:
         if not _should_ignore_probe_exception(con, err):
-            mbox.appendPlainText(str(err))
+            _append_exception(mbox, err, 'Hostname probe failed')
             return -1
 
     # ssh: 3. run cluster utilities directory check
@@ -586,7 +690,7 @@ def open_connection(con, settings, mbox, totp_callback=None):
         return -1
     except Exception as err:
         if not _should_ignore_probe_exception(con, err):
-            mbox.appendPlainText(str(err))
+            _append_exception(mbox, err, 'Utilities directory probe failed')
             return -1
 
     # ssh: 4. run working directory check
@@ -604,7 +708,7 @@ def open_connection(con, settings, mbox, totp_callback=None):
         return -1
     except Exception as err:
         if not _should_ignore_probe_exception(con, err):
-            mbox.appendPlainText(str(err))
+            _append_exception(mbox, err, 'Working directory probe failed')
             return -1
 
     return 0
@@ -635,6 +739,7 @@ def submit(con, settings, mbox):
         msg += f'  path: {dst_dir}\n'
         msg += f'  error: {err}'
         mbox.appendPlainText(msg)
+        _append_exception(mbox, err, 'Remote directory creation error')
         return -1
 
     # ssh: put CST project file (and more) to remote compute node
@@ -646,7 +751,7 @@ def submit(con, settings, mbox):
             if os.path.isfile(src_file):
                 con.put(src_file, dst_dir)
     except Exception as err:
-        mbox.appendPlainText(f'Failed while uploading project files: {err}')
+        _append_exception(mbox, err, 'Failed while uploading project files')
         return -1
 
     # run CST project
@@ -700,7 +805,7 @@ def submit(con, settings, mbox):
             mbox.appendPlainText(f'  exception: {err}')
         return exit_code
     except Exception as err:
-        mbox.appendPlainText(f'Submit execution error: {err}')
+        _append_exception(mbox, err, 'Submit execution error')
         return -1
 
     return 0
@@ -716,14 +821,15 @@ def get_queues(con, settings, mbox):
         ret = con.run(cst_job_submit)
         if ret.stderr:
             mbox.appendPlainText(ret.stderr)
-            return ret.return_code
-    except paramiko.ssh_exception.AuthenticationException:
+    except paramiko.ssh_exception.AuthenticationException as err:
         # Post-auth query calls can still raise auth exceptions in this
         # environment even after the main SSH session is marked successful.
         # Keep the UI clean and return an empty queue list.
+        if is_debug_enabled():
+            _append_exception(mbox, err, 'Queue query authentication exception')
         return ""
     except Exception as err:
-        mbox.appendPlainText(str(err))
+        _append_exception(mbox, err, 'Queue query failed')
         return ""
 
     return ret.stdout
@@ -739,12 +845,13 @@ def get_scheduler(con, settings, mbox):
         ret = con.run(cst_job_submit)
         if ret.stderr:
             mbox.appendPlainText(ret.stderr)
-            return ret.return_code
-    except paramiko.ssh_exception.AuthenticationException:
+    except paramiko.ssh_exception.AuthenticationException as err:
         # Same rationale as get_queues(): avoid noisy false negatives.
+        if is_debug_enabled():
+            _append_exception(mbox, err, 'Scheduler query authentication exception')
         return ""
     except Exception as err:
-        mbox.appendPlainText(str(err))
+        _append_exception(mbox, err, 'Scheduler query failed')
         return ""
 
     return ret.stdout
@@ -764,11 +871,12 @@ def get_available_gpu_num(con, settings, queue, mbox):
         ret = con.run(cst_job_submit)
         if ret.stderr:
             mbox.appendPlainText(ret.stderr)
-            return None
-    except paramiko.ssh_exception.AuthenticationException:
+    except paramiko.ssh_exception.AuthenticationException as err:
+        if is_debug_enabled():
+            _append_exception(mbox, err, 'GPU limit query authentication exception')
         return None
     except Exception as err:
-        mbox.appendPlainText(str(err))
+        _append_exception(mbox, err, 'GPU limit query failed')
         return None
 
     output = ret.stdout.strip()
@@ -814,9 +922,14 @@ def get_available_walltime(con, settings, queue, mbox):
 
     try:
         ret = con.run(cmd)
-    except paramiko.ssh_exception.AuthenticationException:
+        if ret.stderr:
+            mbox.appendPlainText(ret.stderr)
+    except paramiko.ssh_exception.AuthenticationException as err:
+        if is_debug_enabled():
+            _append_exception(mbox, err, 'Walltime query authentication exception')
         return None
-    except Exception:
+    except Exception as err:
+        _append_exception(mbox, err, 'Walltime query failed')
         return None
 
     walltime = _extract_walltime_value(ret.stdout)
