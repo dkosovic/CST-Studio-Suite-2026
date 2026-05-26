@@ -190,17 +190,32 @@ class GroupBoxScheduler(QGroupBox):
         self.combobox_queue = QComboBox(parent)
         self.combobox_queue.currentTextChanged.connect(self.queue_changed)
 
+        self.button_refresh_queues = QPushButton('↻', parent)
+        self.button_refresh_queues.setMaximumWidth(28)
+        self.button_refresh_queues.setToolTip('Re-query queues from HPC cluster')
+        self.button_refresh_queues.setEnabled(False)
+
+        queue_row = QHBoxLayout()
+        queue_row.setContentsMargins(0, 0, 0, 0)
+        queue_row.addWidget(self.combobox_queue)
+        queue_row.addWidget(self.button_refresh_queues)
+        queue_row_widget = QWidget(parent)
+        queue_row_widget.setLayout(queue_row)
+
         layout = QGridLayout(parent)
         layout.addWidget(label_scheduler, 0, 0)
         layout.addWidget(self.scheduler, 0, 1)
         layout.addWidget(label_queue, 1, 0)
-        layout.addWidget(self.combobox_queue, 1, 1)
+        layout.addWidget(queue_row_widget, 1, 1)
 
         self.setTitle("Scheduler settings")
         self.setLayout(layout)
 
     def attach_status_ctrl(self, subject):
         self.subject = subject
+
+    def click_refresh_queues(self, func):
+        self.button_refresh_queues.clicked.connect(lambda checked: func())
 
     def json(self):
         app_settings = {}
@@ -224,6 +239,7 @@ class GroupBoxScheduler(QGroupBox):
     def update(self, key, val):
         if key == 'conn':
             self.setEnabled(val)
+            self.button_refresh_queues.setEnabled(val)
         if key == 'scheduler_name':
             self.scheduler.setText(val)
         if key == 'queue_entries':
@@ -742,7 +758,23 @@ class MyConnect():
         self.message_box.appendHtml('SSH connection: <span style="color:green">success</span>')
         self.subject.notify('conn', True)
 
+        self._fetch_queues(settings)
+
+    def _fetch_queues(self, settings=None):
+        """Query the HPC cluster for available queues and scheduler name."""
+        if self.con is None or self.con.con is None:
+            self.message_box.appendPlainText('Queue query skipped: not connected to cluster.')
+            return
+
+        if settings is None:
+            settings_json = self.settings_json or hpc_json.load()
+            if not settings_json:
+                self.message_box.appendPlainText('Queue query skipped: no cluster settings available.')
+                return
+            settings = hpc_submit.Settings(settings_json)
+
         try:
+            self.message_box.appendPlainText('Querying available queues from cluster...')
             queue_entries_raw = hpc_submit.get_queues(self.con, settings, self.message_box)
             queue_entries_text = str(queue_entries_raw or '').strip()
             if queue_entries_text:
@@ -880,6 +912,7 @@ def main():
 
     myClusterSettingsDlgTest = ClusterSettingsDlg(main_window, my_connect)
     main_window.my_status_bar.click_connect(myClusterSettingsDlgTest.open)
+    my_group_box_scheduler.click_refresh_queues(my_connect._fetch_queues)
 
     my_group_box_scheduler.setEnabled(False)
     my_group_box_simulation.setEnabled(False)
