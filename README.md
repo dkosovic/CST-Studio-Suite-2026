@@ -25,3 +25,20 @@ Modifications include:
 - Memory option accepts Auto or numeric values with optional units (M/MB, G/GB, T/TB). Values are converted to MB before submission.
 - Walltime option accepts `Auto` or `HH:MM`.
 - Remote queue limit queries refine available GPU and walltime options when the scheduler provides this information.
+
+## Increasing Debugging output
+Environment variable `HPC_SUBMIT_DEBUG` can be set to 1 to increase debugging.
+
+How to set it in Windows PowerShell before starting submission GUI:
+```
+$env:HPC_SUBMIT_DEBUG = "1"
+
+& "C:\Program Files\CST Studio Suite 2026\AMD64\python\python.bat" -E -m emag_job_submission_gui.hpc_job_submission_gui
+```
+
+How to set it in Command Prompt before starting submission GUI:
+```
+set HPC_SUBMIT_DEBUG=1
+
+"C:\Program Files\CST Studio Suite 2026\AMD64\python\python.bat" -E -m emag_job_submission_gui.hpc_job_submission_gui
+```
