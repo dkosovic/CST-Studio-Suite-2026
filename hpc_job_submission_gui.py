@@ -23,7 +23,7 @@ from qtpy.QtWidgets import (
     QWidget,
     QAction)
 
-from qtpy.QtGui import QFont, QIcon, QRegularExpressionValidator
+from qtpy.QtGui import QFont, QIcon, QFontDatabase, QRegularExpressionValidator
 from qtpy import QtCore
 from qtpy.QtCore import QThread, Signal, QRegularExpression
 
@@ -33,15 +33,20 @@ from . import hpc_job_submission_lib
 from . import hpc_json
 from . import hpc_submit
 from . import observer
+from . import studio_utils
 import os
 import pathlib
 import sys
 import traceback
 import webbrowser
 
-def get_icon(icon):
+def get_icon(file_name):
     this_dir = pathlib.Path(__file__).parent
-    return str(this_dir / "icons" / icon)
+    return str(this_dir / "icons" / file_name)
+
+def get_font(file_name):
+    this_dir = pathlib.Path(__file__).parent
+    return str(this_dir / "fonts" / file_name)
 
 class StatusBar():
     def __init__(self, parent):
@@ -74,10 +79,6 @@ class MainWindow(QMainWindow):
 
         self.my_status_bar = StatusBar(self)
         self.setStatusBar(self.my_status_bar.q_status_bar)
-
-        font = self.font()
-        font.setPixelSize(13)
-        self.setFont(font)
 
     def show(self):
         show_task_bar_icon_on_windows()
@@ -533,7 +534,7 @@ class ClusterSettingsDlg():
 def show_task_bar_icon_on_windows():
     if os.name == 'nt':
         import ctypes
-        myappid = 'DS.HPC-Job-Submission.2026'
+        myappid = 'DS.HPC-Job-Submission.' + hpc_job_submission_lib.version()
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
 ################################################################################
@@ -883,9 +884,21 @@ def main():
         os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 
     my_connect = MyConnect()
-
     app = QApplication()
     app.setStyle("fusion")
+
+    font_id = QFontDatabase.addApplicationFont(get_font('Inter-Regular.ttf'))
+    if font_id == -1:
+        print('Failed to load font: Inter-Regular.ttf')
+    ui_font = QFont('Inter')
+    ui_font.setPointSizeF(9.25)
+    app.setFont(ui_font)
+
+    font_id = QFontDatabase.addApplicationFont(get_font('FiraMono-Regular.ttf'))
+    if font_id == -1:
+        print('Failed to load font: FiraMono-Regular.ttf')
+    message_box_font = QFont('Fira Mono')
+    message_box_font.setPointSizeF(10.0)
 
     icon = QIcon()
     icon.addFile(get_icon('HPCJobSubmission.ico'))
@@ -898,6 +911,7 @@ def main():
     message_box = hpc_helper.MyPlainTextEdit(centralWidget)
     message_box.setReadOnly(True)
     message_box.setMinimumHeight(250)
+    message_box.setFont(message_box_font)
 
     my_group_box_file = GroupBoxFile(centralWidget, app, message_box)
     my_group_box_scheduler = GroupBoxScheduler(centralWidget)
@@ -941,6 +955,7 @@ def main():
 
     def submit():
         save()
+        studio_utils.save_project(my_group_box_file.filename.text())
         my_connect.submit(hpc_json.load())
 
     def help():

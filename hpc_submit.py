@@ -743,16 +743,25 @@ def submit(con, settings, mbox):
         return -1
 
     # ssh: put CST project file (and more) to remote compute node
+    # Function con.put is causing exceptions for a Windows share on Linux
+    # as there is a chmod() included.
+    # Therefore sftp will be used.
     try:
-        root = os.path.splitext(proj)[0]
+        src_root = os.path.splitext(proj)[0]
+        dst_root = pathlib.Path(dst_dir) / cst_project_name
+        dst_root = dst_root.as_posix()
         extensions = ['.cst', '.inp', '_tosca.par', '_topology_init.onf']
+        sftp = con.con.client.open_sftp()
         for ext in extensions:
-            src_file = root + ext
-            if os.path.isfile(src_file):
-                con.put(src_file, dst_dir)
+            sftp_src_file = src_root + ext
+            sftp_dst_file = dst_root + ext
+            if os.path.isfile(sftp_src_file):
+                sftp.put(sftp_src_file, sftp_dst_file)
     except Exception as err:
         _append_exception(mbox, err, 'Failed while uploading project files')
         return -1
+    finally:
+        sftp.close()
 
     # run CST project
     cst_job_submit = pathlib.PurePosixPath(udir).joinpath('cst_job_submit')
